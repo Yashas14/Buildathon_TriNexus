@@ -21,6 +21,11 @@ env/
 .coverage
 htmlcov/
 
+# Release Gate local lake + scratch bundles
+._lake/
+_real_bundle.json
+*_bundle.local.json
+
 # Databricks
 .databricks/
 
