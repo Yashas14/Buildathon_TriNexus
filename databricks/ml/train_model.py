@@ -60,8 +60,11 @@ def train(data_path: str, register: bool) -> dict:
     )
     model, flavor = _build_model()
 
-    mlflow.set_experiment("/Shared/release_gate_risk" if _on_databricks()
-                          else "release_gate_risk")
+    experiment = os.environ.get("RG_EXPERIMENT")
+    if not experiment:
+        experiment = ("/Shared/release_gate_risk" if _on_databricks()
+                      else "release_gate_risk")
+    mlflow.set_experiment(experiment)
     with mlflow.start_run() as run:
         # Cross-validated AUC on the full set for a stable estimate.
         cv_model, _ = _build_model()

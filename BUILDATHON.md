@@ -19,9 +19,23 @@ evidence into an automated go/no-go decision posted straight onto the PR.
 ## Selected Entire track and why Entire is essential
 
 **Track 3 — Bring Entire to a New Agent or Workflow** (a CI / pull-request
-workflow that uses checkpoint context). The integration lives inside the
-Entire-mirrored clone and is driven by the Entire CLI, not merely shelling out
-from an unrelated app.
+workflow that uses checkpoint context). The integration is a **native Entire CLI
+plugin**: an `entire-release-gate` executable that the Entire CLI discovers on
+PATH and exposes as **`entire release-gate`** (exactly like `entire graph`). So
+Release Gate *is* an Entire command — it does not merely call `entire` from an
+unrelated app, which the guide states "is not sufficient by itself."
+
+```
+entire release-gate score --base <sha> --pr-number 1 --pr-repo owner/name --run-tests
+entire release-gate collect > bundle.json     # emit the evidence bundle
+entire release-gate info                       # plugin metadata
+```
+
+(For Track 3 the designated fork is `entireio/external-agents`, which hosts
+`entire-agent-<name>` *session-capture* binaries; Release Gate is a CI/PR
+workflow, whose correct Entire extension type is a **CLI plugin** `entire-<name>`
+per the Agent Integration Protocol docs. The plugin lives in this Entire-mirrored
+clone.)
 
 Entire is essential, not decorative: the risk model's two most important
 features are **uncomputable without Entire** —
@@ -109,6 +123,11 @@ the Entire mirror.
 ```bash
 # From a clean checkout (Python 3.12):
 pip install -r requirements.txt
+
+# Install Release Gate as a native Entire CLI plugin:
+pip install -e .                                  # builds entire-release-gate
+entire plugin install "$(python -c 'import shutil;print(shutil.which("entire-release-gate"))')"
+entire release-gate score --base <sha> --pr-number 1 --pr-repo owner/name --run-tests
 
 # Run the whole slice locally (no Databricks/quota needed):
 python scripts/run_local_slice.py                 # scores the sample bundle
