@@ -93,12 +93,19 @@ def collect_pr_meta(repo: str, base: str | None, head: str,
 # --------------------------------------------------------------------------- #
 # Entire Graph
 # --------------------------------------------------------------------------- #
-def _changed_symbols(repo: str, head: str) -> list[dict]:
-    """Entity-level change list from `entire graph commit`.
+def _changed_symbols(repo: str, head: str, base: str | None) -> list[dict]:
+    """Entity-level change list for the PR range.
 
+    Uses `entire graph diff --base B --head H` across the whole PR when a base
+    is known, else `entire graph commit H` (H vs its first parent).
     Shape: {"base","head","files":[{"path","changes":[{"name","kind",...}]}]}
     """
-    rc, out, _ = _run(["entire", "graph", "commit", head, "--json", "--repo", repo])
+    if base:
+        cmd = ["entire", "graph", "diff", "--base", base, "--head", head,
+               "--json", "--repo", repo]
+    else:
+        cmd = ["entire", "graph", "commit", head, "--json", "--repo", repo]
+    rc, out, _ = _run(cmd)
     if rc != 0 or not out.strip():
         return []
     try:
@@ -119,16 +126,19 @@ def _changed_symbols(repo: str, head: str) -> list[dict]:
     return syms
 
 
-def _impact_for_symbol(repo: str, symbol: str) -> list[dict]:
+def _impact_json(repo: str, symbol: str) -> dict | None:
     rc, out, _ = _run(
         ["entire", "graph", "impact", "--symbol", symbol, "--repo", repo, "--format", "json"]
     )
     if rc != 0 or not out.strip():
-        return []
+        return None
     try:
-        data = json.loads(out)
+        return json.loads(out)
     except json.JSONDecodeError:
-        return []
+        return None
+
+
+def _rows_from_impact(data: dict) -> list[dict]:
     rows: list[dict] = []
     for section in ("callers", "callees", "type_consumers"):
         for entry in (data.get(section) or {}).get("entries", []) or []:
@@ -146,28 +156,48 @@ def _impact_for_symbol(repo: str, symbol: str) -> list[dict]:
     return rows
 
 
-def collect_graph_impact(repo: str, head: str, changed_files: list[str],
-                         max_symbols: int = 25) -> dict:
+def _is_test_endpoint(ep: dict) -> bool:
+    fp = (ep.get("file_path") or "").lower()
+    nm = ep.get("name") or ""
+    return "test" in fp or nm.startswith("test_")
+
+
+def collect_graph_impact(repo: str, head: str, base: str | None, changed_files: list[str],
+                         max_symbols: int = 25) -> tuple[dict, dict]:
+    """Returns (graph_impact_bundle_block, test_touch_map).
+
+    test_touch_map maps a test function name -> the changed symbols it exercises,
+    derived from the impact callers we already fetch (no extra graph calls).
+    """
     try:
-        changed = _changed_symbols(repo, head)[:max_symbols]
+        changed = _changed_symbols(repo, head, base)[:max_symbols]
         impacted: dict[str, dict] = {}
+        test_touches: dict[str, set] = {}
         for sym in changed:
-            for row in _impact_for_symbol(repo, sym["name"]):
+            data = _impact_json(repo, sym["name"])
+            if not data:
+                continue
+            for row in _rows_from_impact(data):
                 impacted.setdefault(f"{row['file']}::{row['symbol']}", row)
+            for entry in (data.get("callers") or {}).get("entries", []) or []:
+                ep = entry.get("endpoint") or {}
+                if _is_test_endpoint(ep) and ep.get("name"):
+                    test_touches.setdefault(ep["name"], set()).add(sym["name"])
         rows = list(impacted.values())
         blast = {
             "symbol_count": len({r["symbol"] for r in rows}),
             "file_count": len({r["file"] for r in rows if r["file"]}),
             "max_distance": max((r["distance"] for r in rows), default=0),
         }
-        return {"available": bool(changed), "impacted_symbols": rows, "blast_radius": blast}
+        block = {"available": bool(changed), "impacted_symbols": rows, "blast_radius": blast}
+        return block, {k: sorted(v) for k, v in test_touches.items()}
     except Exception as exc:  # noqa: BLE001 - never let graph errors crash CI
         sys.stderr.write(f"[collect_evidence] graph impact unavailable: {exc}\n")
-        return {
-            "available": False,
-            "impacted_symbols": [],
-            "blast_radius": {"symbol_count": 0, "file_count": 0, "max_distance": 0},
-        }
+        return (
+            {"available": False, "impacted_symbols": [],
+             "blast_radius": {"symbol_count": 0, "file_count": 0, "max_distance": 0}},
+            {},
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -228,27 +258,38 @@ def collect_checkpoint_signals(repo: str, changed_files: list[str], limit: int =
 # --------------------------------------------------------------------------- #
 # Tests
 # --------------------------------------------------------------------------- #
-def collect_test_results(repo: str, run_tests: bool) -> dict:
+def collect_test_results(repo: str, run_tests: bool,
+                         test_touches: dict | None = None) -> dict:
+    test_touches = test_touches or {}
     if not run_tests:
         return {"available": False,
                 "summary": {"total": 0, "passed": 0, "failed": 0, "skipped": 0, "duration_s": 0.0},
                 "cases": []}
-    rc, out, err = _run([sys.executable, "-m", "pytest", "-q", "--no-header"], cwd=repo)
+    rc, out, err = _run([sys.executable, "-m", "pytest", "-v", "--no-header"], cwd=repo)
     text = out + "\n" + err
-    m = re.search(r"(\d+) passed", text)
-    passed = int(m.group(1)) if m else 0
-    m = re.search(r"(\d+) failed", text)
-    failed = int(m.group(1)) if m else 0
-    m = re.search(r"(\d+) skipped", text)
-    skipped = int(m.group(1)) if m else 0
-    return {
-        "available": True,
-        "summary": {
-            "total": passed + failed + skipped,
-            "passed": passed, "failed": failed, "skipped": skipped,
+    cases: list[dict] = []
+    counts = {"passed": 0, "failed": 0, "skipped": 0}
+    for line in text.splitlines():
+        m = re.search(r"::(\w+)\s+(PASSED|FAILED|SKIPPED)", line)
+        if not m:
+            continue
+        name, status = m.group(1), m.group(2).lower()
+        counts[status] = counts.get(status, 0) + 1
+        cases.append({
+            "name": name,
+            "status": status,
             "duration_s": 0.0,
+            "touched_symbols": test_touches.get(name, []),
+        })
+    total = sum(counts.values())
+    return {
+        "available": total > 0,
+        "summary": {
+            "total": total,
+            "passed": counts["passed"], "failed": counts["failed"],
+            "skipped": counts["skipped"], "duration_s": 0.0,
         },
-        "cases": [],
+        "cases": cases,
     }
 
 
@@ -258,15 +299,18 @@ def build_bundle(args) -> dict:
         args.repo, args.base, args.head, args.pr_number,
         args.pr_repo, args.author, args.title,
     )
+    graph_impact, test_touches = collect_graph_impact(
+        args.repo, args.head, args.base, pr["changed_files"]
+    )
     return {
         "schema_version": "1.0.0",
         "bundle_id": str(uuid.uuid4()),
         "generated_at": _now_iso(),
         "source": "entire-ci-hook",
         "pr": pr,
-        "graph_impact": collect_graph_impact(args.repo, args.head, pr["changed_files"]),
+        "graph_impact": graph_impact,
         "checkpoint_signals": collect_checkpoint_signals(args.repo, pr["changed_files"]),
-        "test_results": collect_test_results(args.repo, args.run_tests),
+        "test_results": collect_test_results(args.repo, args.run_tests, test_touches),
     }
 
 
