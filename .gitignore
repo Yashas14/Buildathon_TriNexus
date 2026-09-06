@@ -36,3 +36,7 @@ _real_bundle.json
 # OS
 .DS_Store
 Thumbs.db
+
+# MLflow local tracking
+mlruns/
+mlartifacts/

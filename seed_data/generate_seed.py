@@ -15,7 +15,7 @@ import json
 import os
 import random
 
-N = 120
+N = 500
 SEED = 42
 _OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pr_history.jsonl")
 
@@ -74,7 +74,12 @@ def main() -> None:
         for i in range(N):
             f = _sample(rng)
             p = _latent_risk(f)
-            f["label_incident"] = 1 if rng.random() < p else 0
+            # Threshold on latent risk with a controlled 12% label-flip rate:
+            # realistic noise, but a signal a model can actually learn.
+            label = 1 if p >= 0.5 else 0
+            if rng.random() < 0.12:
+                label = 1 - label
+            f["label_incident"] = label
             f["synthetic"] = True
             f["pr_id"] = f"synthetic-{i:04d}"
             fh.write(json.dumps(f) + "\n")
