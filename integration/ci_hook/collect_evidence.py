@@ -94,7 +94,10 @@ def collect_pr_meta(repo: str, base: str | None, head: str,
 # Entire Graph
 # --------------------------------------------------------------------------- #
 def _changed_symbols(repo: str, head: str) -> list[dict]:
-    """Entity-level change list from `entire graph commit`."""
+    """Entity-level change list from `entire graph commit`.
+
+    Shape: {"base","head","files":[{"path","changes":[{"name","kind",...}]}]}
+    """
     rc, out, _ = _run(["entire", "graph", "commit", head, "--json", "--repo", repo])
     if rc != 0 or not out.strip():
         return []
@@ -102,14 +105,17 @@ def _changed_symbols(repo: str, head: str) -> list[dict]:
         data = json.loads(out)
     except json.JSONDecodeError:
         return []
+    wanted = {"function", "method", "class", "type", "interface", "struct", "enum"}
+    seen: set[str] = set()
     syms: list[dict] = []
-    # Be liberal about the shape: collect anything that looks like a changed entity.
-    entries = data.get("changes") or data.get("entities") or data.get("entries") or []
-    for e in entries:
-        name = e.get("name") or e.get("symbol") or (e.get("endpoint") or {}).get("name")
-        path = e.get("file_path") or e.get("file") or (e.get("endpoint") or {}).get("file_path")
-        if name:
-            syms.append({"name": name, "file": path})
+    for f in data.get("files") or []:
+        path = f.get("path")
+        for ch in f.get("changes") or []:
+            name = ch.get("name")
+            kind = ch.get("kind")
+            if name and (kind in wanted) and name not in seen:
+                seen.add(name)
+                syms.append({"name": name, "file": path, "kind": kind})
     return syms
 
 
@@ -132,17 +138,18 @@ def _impact_for_symbol(repo: str, symbol: str) -> list[dict]:
                 continue
             rows.append({
                 "symbol": name,
-                "file": ep.get("file_path"),
-                "kind": ep.get("kind", "unknown"),
+                "file": ep.get("file_path") or "",
+                "kind": ep.get("kind") or "unknown",
                 "relationship": entry.get("relation", "RELATED"),
                 "distance": int(entry.get("depth", 1) or 1),
             })
     return rows
 
 
-def collect_graph_impact(repo: str, head: str, changed_files: list[str]) -> dict:
+def collect_graph_impact(repo: str, head: str, changed_files: list[str],
+                         max_symbols: int = 25) -> dict:
     try:
-        changed = _changed_symbols(repo, head)
+        changed = _changed_symbols(repo, head)[:max_symbols]
         impacted: dict[str, dict] = {}
         for sym in changed:
             for row in _impact_for_symbol(repo, sym["name"]):
